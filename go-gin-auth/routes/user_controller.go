@@ -22,49 +22,90 @@ var validate = validator.New()
 func CreateUser() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		var user models.User
 		defer cancel()
 
-		//validate the request body
+		var user models.User
 		if err := c.BindJSON(&user); err != nil {
-			c.JSON(http.StatusBadRequest, responses.UserResponse{Status: http.StatusBadRequest, Message: "error", Data: map[string]interface{}{"data": err.Error()}})
+			c.JSON(http.StatusBadRequest, responses.UserResponse{
+				Status:  http.StatusBadRequest,
+				Message: "error",
+				Data:    map[string]interface{}{"data": err.Error()},
+			})
 			return
 		}
 
-		//use the validator library to validate required fields
-		if validationErr := validate.Struct(&user); validationErr != nil {
-			c.JSON(http.StatusBadRequest, responses.UserResponse{Status: http.StatusBadRequest, Message: "error", Data: map[string]interface{}{"data": validationErr.Error()}})
+		// Validate user struct in a goroutine
+		validationErrChan := make(chan error, 1)
+		go func() {
+			validationErrChan <- validate.Struct(&user)
+		}()
+
+		// Hash password in parallel with validation
+		hashChan := make(chan controllers.HashResult, 1)
+		go func() {
+			hashed, err := controllers.HashPassword(user.Password)
+			hashChan <- controllers.HashResult{Hashed: hashed, Err: err}
+		}()
+
+		// Wait for validation
+		if validationErr := <-validationErrChan; validationErr != nil {
+			c.JSON(http.StatusBadRequest, responses.UserResponse{
+				Status:  http.StatusBadRequest,
+				Message: "error",
+				Data:    map[string]interface{}{"data": validationErr.Error()},
+			})
 			return
 		}
-		hashed_password, err1 := controllers.HashPassword(user.Password)
-		if err1 != nil {
-			c.JSON(http.StatusInternalServerError, responses.UserResponse{Status: http.StatusInternalServerError, Message: "error hashing password", Data: map[string]interface{}{"data": err1.Error()}})
+
+		// Wait for password hash
+		hashResult := <-hashChan
+		if hashResult.Err != nil {
+			c.JSON(http.StatusInternalServerError, responses.UserResponse{
+				Status:  http.StatusInternalServerError,
+				Message: "error hashing password",
+				Data:    map[string]interface{}{"data": hashResult.Err.Error()},
+			})
 			return
 		}
+
 		newUser := models.User{
 			Id:       primitive.NewObjectID(),
 			Name:     user.Name,
 			Email:    user.Email,
-			Password: hashed_password,
+			Password: hashResult.Hashed,
 		}
 
-		result, err := userCollection.InsertOne(ctx, newUser)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, responses.UserResponse{Status: http.StatusInternalServerError, Message: "error", Data: map[string]interface{}{"data": err.Error()}})
+		// Insert user in a goroutine
+		insertChan := make(chan controllers.InsertResult, 1)
+		go func() {
+			result, err := userCollection.InsertOne(ctx, newUser)
+			insertChan <- controllers.InsertResult{Result: result, Err: err}
+		}()
+
+		insertResult := <-insertChan
+		if insertResult.Err != nil {
+			c.JSON(http.StatusInternalServerError, responses.UserResponse{
+				Status:  http.StatusInternalServerError,
+				Message: "error",
+				Data:    map[string]interface{}{"data": insertResult.Err.Error()},
+			})
 			return
 		}
 
-		c.JSON(http.StatusCreated, responses.UserResponse{Status: http.StatusCreated, Message: "success", Data: map[string]interface{}{"data": result}})
+		c.JSON(http.StatusCreated, responses.UserResponse{
+			Status:  http.StatusCreated,
+			Message: "success",
+			Data:    map[string]interface{}{"data": insertResult.Result},
+		})
 	}
 }
+
 func GetAUser() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		var loginRequest models.LoginRequest
-		var user models.User
 		defer cancel()
 
-		// Validate request body
+		var loginRequest models.LoginRequest
 		if err := c.BindJSON(&loginRequest); err != nil {
 			c.JSON(http.StatusBadRequest, responses.UserResponse{
 				Status:  http.StatusBadRequest,
@@ -74,9 +115,16 @@ func GetAUser() gin.HandlerFunc {
 			return
 		}
 
-		// Find user by email
-		err := userCollection.FindOne(ctx, bson.M{"email": loginRequest.Email}).Decode(&user)
-		if err != nil {
+		// Find user by email in a goroutine
+		userChan := make(chan controllers.UserResult, 1)
+		go func() {
+			var user models.User
+			err := userCollection.FindOne(ctx, bson.M{"email": loginRequest.Email}).Decode(&user)
+			userChan <- controllers.UserResult{User: user, Err: err}
+		}()
+
+		userResult := <-userChan
+		if userResult.Err != nil {
 			c.JSON(http.StatusInternalServerError, responses.UserResponse{
 				Status:  http.StatusInternalServerError,
 				Message: "error",
@@ -85,9 +133,13 @@ func GetAUser() gin.HandlerFunc {
 			return
 		}
 
-		// Verify password (assuming you have a password hashing mechanism)
-		// You should have a function to compare hashed password with input password
-		if !controllers.CheckPassword(loginRequest.Password, user.Password) {
+		// Verify password in a goroutine
+		passwordChan := make(chan bool, 1)
+		go func() {
+			passwordChan <- controllers.CheckPassword(loginRequest.Password, userResult.User.Password)
+		}()
+
+		if !<-passwordChan {
 			c.JSON(http.StatusUnauthorized, responses.UserResponse{
 				Status:  http.StatusUnauthorized,
 				Message: "error",
@@ -96,10 +148,15 @@ func GetAUser() gin.HandlerFunc {
 			return
 		}
 
-		// Generate JWT token
-		token, err := controllers.GenerateToken(user.Id.Hex())
+		// Generate token in a goroutine
+		tokenChan := make(chan controllers.TokenResult, 1)
+		go func() {
+			token, err := controllers.GenerateToken(userResult.User.Id.Hex())
+			tokenChan <- controllers.TokenResult{Token: token, Err: err}
+		}()
 
-		if err != nil {
+		tokenResult := <-tokenChan
+		if tokenResult.Err != nil {
 			c.JSON(http.StatusInternalServerError, responses.UserResponse{
 				Status:  http.StatusInternalServerError,
 				Message: "error",
@@ -111,7 +168,7 @@ func GetAUser() gin.HandlerFunc {
 		c.JSON(http.StatusOK, responses.UserResponse{
 			Status:  http.StatusOK,
 			Message: "success",
-			Data:    map[string]interface{}{"token": token, "user": user},
+			Data:    map[string]interface{}{"token": tokenResult.Token, "user": userResult.User},
 		})
 	}
 }
